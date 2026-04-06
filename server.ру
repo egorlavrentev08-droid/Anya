@@ -1,0 +1,232 @@
+import asyncio
+import sqlite3
+import random
+import requests
+from datetime import datetime, timedelta
+from typing import List, Tuple
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ========== НАСТРОЙКИ ==========
+TELEGRAM_TOKEN = "8219806591:AAHfQIwwwlO2BsGwLAV9THXYXZ8NL6t7hDs"
+
+YANDEX_FOLDER_ID = "b1g95v8hu0f52k8pkail"
+YANDEX_API_KEY = "AQVN3tmE96Njgdb-HckhvA2-mK1cjYyMstQglwSb"
+YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+MY_USER_ID = 1968821319
+
+ENEMY_USER_IDS = {
+    5671873833, 5377362106, 5601784321, 5262124397, 1718510466,
+    5017134390, 5961277554, 6240399497, 6854164790, 7959620279
+}
+
+GREETING_MESSAGES = [
+    "Привет, солнышко! Как дела? 💖",
+    "Эй, красавчик, как настроение? 😘",
+    "Как твои делишки? Соскучилась по тебе! 💓",
+    "Чем занимаешься, мой хороший? 🤗",
+    "Как прошел твой день, любимый? 💋",
+]
+
+LOVE_RESPONSES = [
+    "Я тоже тебя обожаю, солнышко моё! 💖",
+    "Ты мой самый любимый человек на свете! 😘",
+    "Сердце ёкает, когда ты пишешь такие слова! 💓",
+    "Обнимаю тебя крепко-крепко, моя радость! 🤗",
+]
+
+FALLBACK_RESPONSES = [
+    "Ой, что-то я растерялась... Давай поговорим о чём-то другом? 😅",
+    "Ты такой интересный собеседник! 💫",
+    "Я вся краснею от твоих слов! 😳",
+]
+
+INSULTS_FOR_ENEMIES = [
+    "Твой интеллект конкурирует с камнем. Проигрывает.",
+    "Ты как браузер Опера — тормозной и никому не нужный.",
+    "Иди нахуй, семьянин."
+]
+
+class MemorySystem:
+    def __init__(self, db_path="anya_memory.db"):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    user_id INTEGER,
+                    message TEXT,
+                    response TEXT,
+                    timestamp DATETIME
+                )
+            """)
+    
+    def add_exchange(self, user_id: int, user_message: str, bot_response: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO conversations (user_id, message, response, timestamp) VALUES (?, ?, ?, ?)",
+                (user_id, user_message, bot_response, datetime.now())
+            )
+            month_ago = datetime.now() - timedelta(days=30)
+            conn.execute("DELETE FROM conversations WHERE timestamp < ?", (month_ago,))
+    
+    def get_recent_history(self, user_id: int, days: int = 30) -> List[Tuple]:
+        since_date = datetime.now() - timedelta(days=days)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT message, response, timestamp 
+                FROM conversations 
+                WHERE user_id = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+                LIMIT 50
+            """, (user_id, since_date))
+            return cursor.fetchall()
+    
+    def clear_user_memory(self, user_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+    
+    def get_stats(self, user_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM conversations WHERE user_id = ?", (user_id,))
+            return cursor.fetchone()[0]
+
+memory = MemorySystem()
+
+def call_yandex_gpt(prompt: str) -> str:
+    body = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+        "completionOptions": {"stream": False, "temperature": 0.8, "maxTokens": 150},
+        "messages": [
+            {"role": "system", "text": "Ты Аня, милая 19-летняя девушка. Отвечай коротко, с эмодзи, по-русски."},
+            {"role": "user", "text": prompt}
+        ]
+    }
+    
+    headers = {"Content-Type": "application/json", "Authorization": f"Api-Key {YANDEX_API_KEY}"}
+    
+    try:response = requests.post(YANDEX_URL, json=body, headers=headers, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        return result['result']['alternatives'][0]['message']['text'].strip()[:400]
+    except Exception as e:
+        print(f"YandexGPT ошибка: {e}")
+        return None
+
+async def generate_response_with_memory(user_id: int, user_text: str) -> str:
+    history = memory.get_recent_history(user_id, days=30)
+    
+    context = ""
+    if history:
+        context = "История общения:\n\n"
+        for msg, resp, ts in history[-10:]:
+            context += f"Парень: {msg}\nАня: {resp}\n\n"
+        context += "Продолжи диалог:\n"
+    
+    prompt = f"{context}Парень: {user_text}\nАня:"
+    
+    answer = call_yandex_gpt(prompt)
+    if not answer:
+        answer = random.choice(FALLBACK_RESPONSES)
+    
+    memory.add_exchange(user_id, user_text, answer)
+    return answer
+
+def is_enemy(user_id: int) -> bool:
+    return user_id in ENEMY_USER_IDS
+
+def is_love_message(text: str) -> bool:
+    love_words = ['люблю', 'обожаю', 'скучаю']
+    return any(word in text.lower() for word in love_words)
+
+def is_farm_command(text: str) -> bool:
+    return text.lower().strip() in ["аня фарми", "аня, фарми"]
+
+def is_rp_command(text: str) -> bool:
+    return any(word in text.lower() for word in ["обнять", "поцеловать"])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_enemy(user.id):
+        await update.message.reply_text(random.choice(INSULTS_FOR_ENEMIES))
+        return
+    
+    await update.message.reply_text(
+        f"Привет, {user.first_name}! 💖\n"
+        "Я Аня, твоя виртуальная подружка!\n\n"
+        "📝 Я помню всё (30 дней)\n"
+        "🤗 Обними или поцелуй меня\n"
+        "💕 Скажи 'люблю' - я растаю\n"
+        "🎮 Скажи 'аня фарми' - помогу с фармом\n"
+        "📊 /memory - что я помню\n"
+        "🗑️ /forget - забыть всё"
+    )
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user_id = message.from_user.id
+    user_text = message.text or ""
+    
+    if is_enemy(user_id):
+        await message.reply_text(random.choice(INSULTS_FOR_ENEMIES))
+        return
+    
+    if not message.text:
+        await message.reply_text("Я понимаю только текстовые сообщения 😊")
+        return
+    
+    if message.chat.type != 'private':
+        bot_username = context.bot.username.lower()
+        if f'@{bot_username}' not in message.text.lower():
+            return
+    
+    if is_farm_command(user_text):
+        await message.reply_text("/cookie")
+        return
+    
+    if is_rp_command(user_text):
+        if "обнять" in user_text.lower():
+            await message.reply_text("*Обнимаю тебя крепко* 🤗")
+        elif "поцеловать" in user_text.lower():
+            await message.reply_text("*Целую в щёчку* 😳💋")
+        return
+    
+    if is_love_message(user_text):
+        await message.reply_text(random.choice(LOVE_RESPONSES))
+        return
+    
+    response = await generate_response_with_memory(user_id, user_text)
+    await message.reply_text(response)
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    history = memory.get_recent_history(user_id, days=30)
+    await update.message.reply_text(f"📝 Я помню {len(history)} твоих сообщений за месяц!")
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    memory.clear_user_memory(user_id)
+    await update.message.reply_text("Я всё забыла... Начинаем сначала? 😔💔")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = memory.get_stats(user_id)
+    await update.message.reply_text(f"📊 Я помню {count} твоих сообщений за 30 дней 💾")
+
+def run_bot():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("forget", forget_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    
+    print("Бот Аня запущен!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    run_bot()
