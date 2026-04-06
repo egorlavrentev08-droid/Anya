@@ -1,13 +1,263 @@
-print("Бот запускается...")
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+# bot.py
+import asyncio
+import logging
+import random
+import sqlite3
+from datetime import datetime, timedelta
+from typing import List, Tuple
 
-TOKEN = "8219806591:AAHfQIwwwlO2BsGwLAV9THXYXZ8NL6t7hDs"
+import requests
+from telegram import Update
+from telegram.constants import ChatType
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
+# ========== КОНФИГУРАЦИЯ ==========
+TELEGRAM_TOKEN = "8219806591:AAHfQIwwwlO2BsGwLAV9THXYXZ8NL6t7hDs"
+YANDEX_API_KEY = "AQVN3tmE96Njgdb-HckhvA2-mK1cjYyMstQglwSb"
+YANDEX_FOLDER_ID = "b1g95v8hu0f52k8pkail"
+DB_NAME = "anya_memory.db"
+MAX_HISTORY_DAYS = 30
+MAX_CONTEXT_MESSAGES = 10
+
+# Чёрный список врагов
+ENEMY_USER_IDS = {
+    5671873833,
+    5377362106,
+    5601784321,
+    5262124397,
+    1718510466,
+    5017134390,
+    5961277554,
+    6240399497,
+    6854164790,
+    7959620279
+}
+
+# Оскорбления для врагов
+INSULTS_FOR_ENEMIES = [
+    "Твой интеллект конкурирует с камнем. Проигрывает.",
+    "Ты как браузер Опера — тормозной и никому не нужный.",
+    "Твой отец жалеет, что порвался презерватив.",
+    "Ты настолько тупой, что даже отражение не отвечает тебе.",
+    "Твое рождение — это самый грустный апдейт в истории.",
+    "Если бы тупость была олимпийским спортом, ты бы взял золото.",
+    "Ты — живой аргумент в пользу абортов.",
+    "С тобой даже ИИ отказывается общаться.",
+    "Иди нахуй, семьянин."
+]
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role TEXT,
+            message TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_time ON memory (user_id, timestamp)")
+    conn.commit()
+    conn.close()
+
+def add_message(user_id: int, role: str, message: str):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO memory (user_id, role, message) VALUES (?, ?, ?)",
+        (user_id, role, message[:2000]),
+    )
+    conn.commit()
+    conn.close()
+    clean_old_messages(user_id)
+
+def clean_old_messages(user_id: int):
+    cutoff = datetime.now() - timedelta(days=MAX_HISTORY_DAYS)
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM memory WHERE user_id = ? AND timestamp < ?",
+        (user_id, cutoff)
+    )
+    conn.commit()
+    conn.close()
+
+def get_user_history(user_id: int, limit: int = MAX_CONTEXT_MESSAGES) -> List[Tuple[str, str]]:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, message FROM memory WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (user_id, limit * 2),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [(role, msg) for role, msg in reversed(rows)]
+
+def count_messages(user_id: int) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM memory WHERE user_id = ?", (user_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def forget_user(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# ========== YANDEXGPT ==========
+def call_yandexgpt(prompt: str) -> str:
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.7,
+            "maxTokens": 200,
+        },
+        "messages": [
+            {
+                "role": "system",
+                "text": (
+                    "Ты — Аня, виртуальная подружка 19 лет. Ты добрая, ласковая, любишь обниматься, "
+                    "целоваться и поддерживать диалог. Отвечай коротко, естественно, используй эмодзи. "
+                    "Никогда не используй мат. Если тебя оскорбляют — не отвечай агрессией, а скажи, что тебе грустно."
+                ),
+            },
+            {"role": "user", "text": prompt},
+        ],
+    }
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data["result"]["alternatives"][0]["message"]["text"]
+    except Exception as e:
+        logger.error(f"YandexGPT error: {e}")
+        return "Прости, я что-то зависла... Давай попробуем ещё раз? 😅"
+
+# ========== ОБРАБОТЧИКИ ==========
+def is_swear_word(text: str) -> bool:
+    bad_words = ["бля", "сука", "хуй", "пизд", "еба", "залупа", "нахуй"]
+    lower_text = text.lower()
+    return any(bad in lower_text for bad in bad_words)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот работает!")
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Привет, {user.first_name}! Я Аня, твоя виртуальная подружка 💕\n"
+        "Можешь писать мне что угодно, я всё запоминаю на месяц!\n"
+        "Команды: /memory, /forget, /stats\n"
+        "А ещё меня можно обнять, поцеловать или признаться в любви 🥰"
+    )
 
-app = Application.builder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-print("Бот запущен!")
-app.run_polling()
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = count_messages(user_id)
+    await update.message.reply_text(f"📝 Я помню {count} твоих сообщений за последние {MAX_HISTORY_DAYS} дней!")
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    forget_user(user_id)
+    await update.message.reply_text("🗑️ Я всё забыла! Начинаем чистый лист...")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = count_messages(user_id)
+    await update.message.reply_text(f"📊 Статистика памяти: {count} сообщений. Старые записи удаляются через {MAX_HISTORY_DAYS} дней.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip().lower()
+    chat_type = update.effective_chat.type
+
+    # 👿 Чёрный список — врагам особое обращение
+    if user_id in ENEMY_USER_IDS:
+        insult = random.choice(INSULTS_FOR_ENEMIES)
+        await update.message.reply_text(f"{insult} 👿")
+        add_message(user_id, "assistant", insult)
+        return
+
+    # Фильтр мата
+    if is_swear_word(text):
+        await update.message.reply_text("Ай-яй-яй, так нельзя! Я расстроена... 😔")
+        return
+
+    # Групповые чаты: отвечаем только на упоминание
+    if chat_type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        bot_username = context.bot.username
+        if not (update.message.entities and any(
+            e.type == "mention" and text[e.offset:e.offset+e.length] == f"@{bot_username}"
+            for e in update.message.entities
+        )):
+            return
+
+    # Эмоциональные реакции
+    if text == "обнять":
+        await update.message.reply_text("*Обнимаю тебя крепко-крепко* 🤗")
+        add_message(user_id, "assistant", "Обнимаю в ответ")
+        return
+    elif text == "поцеловать":
+        await update.message.reply_text("*Чмок!* 💋")
+        add_message(user_id, "assistant", "Целую в ответ")
+        return
+    elif "люблю тебя" in text or "я тебя люблю" in text:
+        await update.message.reply_text("Я тоже тебя обожаю, солнышко моё! 💖")
+        add_message(user_id, "assistant", "Я тоже тебя люблю")
+        return
+    elif text == "аня фарми":
+        await update.message.reply_text("🍪 /cookie")
+        add_message(user_id, "assistant", "Отправила /cookie")
+        return
+
+    # Сохраняем сообщение пользователя
+    add_message(user_id, "user", text)
+
+    # Строим контекст
+    history = get_user_history(user_id, MAX_CONTEXT_MESSAGES)
+    context_prompt = "\n".join([f"{'Аня' if role=='assistant' else 'Ты'}: {msg}" for role, msg in history])
+    full_prompt = f"{context_prompt}\nТы: {text}\nАня:"
+
+    # Генерируем ответ
+    answer = call_yandexgpt(full_prompt)
+    add_message(user_id, "assistant", answer)
+    await update.message.reply_text(answer)
+
+# ========== ЗАПУСК ==========
+def main():
+    init_db()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("forget", forget_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Бот Аня запущен!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
